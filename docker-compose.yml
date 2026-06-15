@@ -23,6 +23,10 @@ services:
       X_FRAME_OPTIONS: "sameorigin"
 
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./npm-custom/server_proxy.conf:/data/nginx/custom/server_proxy.conf
+      - ./npm-custom/http_top.conf:/data/nginx/custom/http_top.conf
+      - ./wakeonrequest.lua:/data/nginx/custom/wakeonrequest.lua
       # NPM persistent data
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt

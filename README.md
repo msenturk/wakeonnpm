@@ -1,5 +1,7 @@
 # Wake-On-Request
 
+** DONT USE IT YET ***
+
 [![Master](https://img.shields.io/badge/branch-master-blue.svg)](https://github.com/msenturk/wake-on-request)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
