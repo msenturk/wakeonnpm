@@ -4,9 +4,12 @@
 # https://github.com/msenturk/wake-on-request
 #
 # Usage:
-#   ./install.sh                  Install in current directory
-#   ./install.sh /path/to/npm     Install in specified directory
-#   ./install.sh --dry-run        Preview what will change, no files written
+#   ./install.sh                     Install in current directory
+#   ./install.sh /path/to/npm        Install in specified directory
+#   ./install.sh --path /path/to/npm Target specific NPM directory
+#   ./install.sh --dry-run           Preview what will change, no files written
+#   ./install.sh --npm <container>   Manually specify the NPM container name/ID
+#   ./install.sh -h, --help          Show this help message
 # ==============================================================================
 
 set -euo pipefail
@@ -28,14 +31,72 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'
 YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ── Argument Parsing ───────────────────────────────────────────────────────────
+show_usage() {
+    echo -e "${BOLD}Wake-On-Request Installer${NC}"
+    echo -e "Usage:"
+    echo -e "  ./install.sh [target_dir] [options]"
+    echo ""
+    echo -e "Options:"
+    echo -e "  --dry-run                Preview what will change, no files written"
+    echo -e "  --npm, -npm <container>  Manually specify the Nginx Proxy Manager container name/ID"
+    echo -e "  --path, -p <dir>         Target NPM directory (defaults to current directory)"
+    echo -e "  -h, --help               Show this help message and exit"
+    echo ""
+}
+
 DRY_RUN=false
-TARGET_DIR="."
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run) DRY_RUN=true ;;
-        *) TARGET_DIR="$arg" ;;
+TARGET_DIR=""
+NPM_CONTAINER_OVERRIDE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --npm|-npm)
+            if [ -n "${2:-}" ]; then
+                NPM_CONTAINER_OVERRIDE="$2"
+                shift 2
+            else
+                echo -e "${RED}❌ Missing value for $1 argument${NC}"
+                exit 1
+            fi
+            ;;
+        --npm=*|-npm=*)
+            NPM_CONTAINER_OVERRIDE="${1#*=}"
+            shift
+            ;;
+        --path|-p)
+            if [ -n "${2:-}" ]; then
+                TARGET_DIR="$2"
+                shift 2
+            else
+                echo -e "${RED}❌ Missing value for $1 argument${NC}"
+                exit 1
+            fi
+            ;;
+        --path=*|-p=*)
+            TARGET_DIR="${1#*=}"
+            shift
+            ;;
+        *)
+            if [ -z "$TARGET_DIR" ]; then
+                TARGET_DIR="$1"
+            else
+                echo -e "${RED}❌ Unknown argument: $1${NC}"
+                exit 1
+            fi
+            shift
+            ;;
     esac
 done
+
+TARGET_DIR="${TARGET_DIR:-.}"
 
 if [ ! -d "$TARGET_DIR" ]; then
     echo -e "${RED}❌ Directory not found: $TARGET_DIR${NC}"; exit 1
@@ -69,6 +130,98 @@ detect_docker_cli() {
     if [ -n "$DOCKER_CMD" ]; then
         return 0
     fi
+
+    # Check if we are running under sudo and SUDO_USER is set
+    if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        # 1. Prioritize daemon containing the NPM container
+        local user_npm_in_podman=false
+        if sudo -u "$SUDO_USER" command -v podman >/dev/null 2>&1 && sudo -u "$SUDO_USER" podman ps -a --format '{{.Image}}' 2>/dev/null | grep -q "nginx-proxy-manager"; then
+            user_npm_in_podman=true
+        fi
+        local user_npm_in_docker=false
+        if sudo -u "$SUDO_USER" command -v docker >/dev/null 2>&1 && sudo -u "$SUDO_USER" docker ps -a --format '{{.Image}}' 2>/dev/null | grep -q "nginx-proxy-manager"; then
+            user_npm_in_docker=true
+        fi
+
+        if [ "$user_npm_in_podman" = true ] && [ "$user_npm_in_docker" = false ]; then
+            DOCKER_CMD="sudo -u $SUDO_USER podman"
+            return 0
+        fi
+        if [ "$user_npm_in_docker" = true ] && [ "$user_npm_in_podman" = false ]; then
+            DOCKER_CMD="sudo -u $SUDO_USER docker"
+            return 0
+        fi
+
+        # 2. Check running container count
+        local user_podman_count=0
+        if sudo -u "$SUDO_USER" command -v podman >/dev/null 2>&1 && sudo -u "$SUDO_USER" podman ps -q >/dev/null 2>&1; then
+            user_podman_count=$(sudo -u "$SUDO_USER" podman ps -q | wc -l)
+        fi
+        local user_docker_count=0
+        if sudo -u "$SUDO_USER" command -v docker >/dev/null 2>&1 && sudo -u "$SUDO_USER" docker ps -q >/dev/null 2>&1; then
+            user_docker_count=$(sudo -u "$SUDO_USER" docker ps -q | wc -l)
+        fi
+
+        if [ "$user_podman_count" -gt 0 ] && [ "$user_docker_count" -eq 0 ]; then
+            DOCKER_CMD="sudo -u $SUDO_USER podman"
+            return 0
+        fi
+        if [ "$user_docker_count" -gt 0 ] && [ "$user_podman_count" -eq 0 ]; then
+            DOCKER_CMD="sudo -u $SUDO_USER docker"
+            return 0
+        fi
+
+        # 3. Fallback to user commands if no running containers found but binaries exist
+        if sudo -u "$SUDO_USER" command -v podman >/dev/null 2>&1 && sudo -u "$SUDO_USER" podman ps >/dev/null 2>&1; then
+            DOCKER_CMD="sudo -u $SUDO_USER podman"
+            return 0
+        fi
+        if sudo -u "$SUDO_USER" command -v docker >/dev/null 2>&1 && sudo -u "$SUDO_USER" docker ps >/dev/null 2>&1; then
+            DOCKER_CMD="sudo -u $SUDO_USER docker"
+            return 0
+        fi
+    fi
+
+    # Standard detection (non-sudo or root)
+    # 1. Prioritize daemon containing NPM container
+    local npm_in_podman=false
+    if command -v podman >/dev/null 2>&1 && podman ps -a --format '{{.Image}}' 2>/dev/null | grep -q "nginx-proxy-manager"; then
+        npm_in_podman=true
+    fi
+    local npm_in_docker=false
+    if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Image}}' 2>/dev/null | grep -q "nginx-proxy-manager"; then
+        npm_in_docker=true
+    fi
+
+    if [ "$npm_in_podman" = true ] && [ "$npm_in_docker" = false ]; then
+        DOCKER_CMD="podman"
+        return 0
+    fi
+    if [ "$npm_in_docker" = true ] && [ "$npm_in_podman" = false ]; then
+        DOCKER_CMD="docker"
+        return 0
+    fi
+
+    # 2. Check running container count
+    local podman_count=0
+    if command -v podman >/dev/null 2>&1 && podman ps -q >/dev/null 2>&1; then
+        podman_count=$(podman ps -q | wc -l)
+    fi
+    local docker_count=0
+    if command -v docker >/dev/null 2>&1 && docker ps -q >/dev/null 2>&1; then
+        docker_count=$(docker ps -q | wc -l)
+    fi
+
+    if [ "$podman_count" -gt 0 ] && [ "$docker_count" -eq 0 ]; then
+        DOCKER_CMD="podman"
+        return 0
+    fi
+    if [ "$docker_count" -gt 0 ] && [ "$podman_count" -eq 0 ]; then
+        DOCKER_CMD="docker"
+        return 0
+    fi
+
+    # 3. Default to binaries
     if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
         DOCKER_CMD="docker"
         return 0
@@ -84,18 +237,50 @@ has_docker() {
 }
 
 NPM_PROXY_HOSTS=""
+find_npm_container_id() {
+    if ! has_docker; then
+        echo ""
+        return
+    fi
+    local npm_cid=""
+    if [ -n "${NPM_CONTAINER_OVERRIDE:-}" ]; then
+        npm_cid=$($DOCKER_CMD ps -q -f "name=${NPM_CONTAINER_OVERRIDE}" 2>/dev/null | head -n1)
+        [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "id=${NPM_CONTAINER_OVERRIDE}" 2>/dev/null | head -n1)
+        [ -z "$npm_cid" ] && npm_cid="$NPM_CONTAINER_OVERRIDE"
+    else
+        # Try local compose service first if in NPM directory
+        npm_cid=$($DOCKER_CMD compose ps -q app 2>/dev/null || true)
+        [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD compose ps -q nginx-proxy-manager 2>/dev/null || true)
+        
+        # Fallback to scanning all containers
+        if [ -z "$npm_cid" ]; then
+            local container_ids
+            container_ids=$($DOCKER_CMD ps -a -q || true)
+            for cid in $container_ids; do
+                local img
+                img=$($DOCKER_CMD inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)
+                if echo "$img" | grep -q "nginx-proxy-manager"; then
+                    npm_cid="$cid"
+                    break
+                fi
+            done
+        fi
+    fi
+    echo "$npm_cid"
+}
+
 fetch_npm_proxy_hosts() {
     if ! has_docker; then
         return
     fi
     local npm_cid
-    npm_cid=$($DOCKER_CMD compose ps -q app 2>/dev/null || true)
-    [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD compose ps -q nginx-proxy-manager 2>/dev/null || true)
-    [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "name=nginx-proxy-manager" 2>/dev/null | head -n1)
-    [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "ancestor=jc21/nginx-proxy-manager" 2>/dev/null | head -n1)
+    npm_cid=$(find_npm_container_id)
     if [ -n "$npm_cid" ]; then
-        NPM_PROXY_HOSTS=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
-            "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null || echo "")
+        NPM_PROXY_HOSTS=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute('SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;'); [print(f\"{row[0]}|{row[1]}|{row[2]}\") for row in cursor.fetchall()]" 2>/dev/null || true)
+        if [ -z "$NPM_PROXY_HOSTS" ]; then
+            NPM_PROXY_HOSTS=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
+                "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null || echo "")
+        fi
     fi
 }
 
@@ -148,18 +333,10 @@ scan_docker_environment() {
     container_ids=$($DOCKER_CMD ps -a -q || true)
 
     # Find NPM container
-    npm_id=""
-    for cid in $container_ids; do
-        local img
-        img=$($DOCKER_CMD inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)
-        if echo "$img" | grep -q "nginx-proxy-manager"; then
-            npm_id="$cid"
-            break
-        fi
-    done
+    npm_id=$(find_npm_container_id)
 
     if [ -n "$npm_id" ]; then
-        npm_networks=$($DOCKER_CMD inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$npm_id" 2>/dev/null || true)
+        npm_networks=$($DOCKER_CMD inspect --format '{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' "$npm_id" 2>/dev/null || true)
     fi
 
     local restart_warning=""
@@ -170,7 +347,7 @@ scan_docker_environment() {
 
         # Inspect container
         local details
-        details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid" 2>/dev/null || true)
+        details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' "$cid" 2>/dev/null || true)
         [ -z "$details" ] && continue
 
         # Parse fields
@@ -298,18 +475,10 @@ run_dry_run() {
         container_ids=$($DOCKER_CMD ps -a -q || true)
         
         # Find NPM container
-        npm_id=""
-        for cid in $container_ids; do
-            local img
-            img=$($DOCKER_CMD inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)
-            if echo "$img" | grep -q "nginx-proxy-manager"; then
-                npm_id="$cid"
-                break
-            fi
-        done
+        npm_id=$(find_npm_container_id)
 
         if [ -n "$npm_id" ]; then
-            npm_networks=$($DOCKER_CMD inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$npm_id" 2>/dev/null || true)
+            npm_networks=$($DOCKER_CMD inspect --format '{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' "$npm_id" 2>/dev/null || true)
         fi
 
         for cid in $container_ids; do
@@ -317,13 +486,13 @@ run_dry_run() {
 
             # Get container details via Go Template (including IPAddress)
             local details
-            details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}|{{if .Config.ExposedPorts}}{{range $k, $v := .Config.ExposedPorts}}{{$k}} {{end}}{{end}}|{{if .NetworkSettings.Ports}}{{range $k, $v := .NetworkSettings.Ports}}{{range $v}}{{.HostPort}} {{end}}{{end}}{{end}}|{{range $k, $v := .NetworkSettings.Networks}}{{$v.IPAddress}} {{end}}' "$cid" 2>/dev/null || true)
+            details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$cid" 2>/dev/null || true)
 
             [ -z "$details" ] && continue
 
             # Parse fields
-            local cname state restart network enabled domain idle start port_label compose_file svc_name networks exposed_ports published_ports ips
-            IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks exposed_ports published_ports ips <<< "$details"
+            local cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips
+            IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips <<< "$details"
             cname="${cname#/}"
 
             # Strip "<no value>" strings from labels (for older docker engines/podman)
@@ -334,6 +503,16 @@ run_dry_run() {
             port_label="${port_label#<no value>}"
             compose_file="${compose_file#<no value>}"
             svc_name="${svc_name#<no value>}"
+
+            # Parse exposed and published ports from raw_ports
+            local exposed_ports="" published_ports=""
+            if [ -n "$raw_ports" ]; then
+                raw_ports="${raw_ports#<no value>}"
+                if [ -n "$raw_ports" ] && [ "$raw_ports" != "map[]" ]; then
+                    exposed_ports=$(echo "$raw_ports" | grep -oE '[0-9]+/(tcp|udp)' | tr '\n' ' ' || echo "")
+                    published_ports=$(echo "$raw_ports" | grep -oE '[0-9]+\}' | tr -d '}' | tr '\n' ' ' || echo "")
+                fi
+            fi
 
             echo ""
             # ── Already configured ────────────────────────────────────────────
@@ -376,7 +555,7 @@ run_dry_run() {
 
             # Match against NPM SQLite database
             local matched_domain="" matched_port=""
-            find_npm_config_for_container "$cname" "$ips"
+            find_npm_config_for_container "$cname" "$ips" || true
 
             if [ -n "$port_label" ]; then
                 detected_port="$port_label"
@@ -510,8 +689,11 @@ run_dry_run() {
             [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "ancestor=jc21/nginx-proxy-manager" 2>/dev/null | head -n1)
             if [ -n "$npm_cid" ]; then
                 local count
-                count=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
-                    "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null || echo "")
+                count=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';\"); print(cursor.fetchone()[0])" 2>/dev/null || true)
+                if [ -z "$count" ]; then
+                    count=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
+                        "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null || echo "")
+                fi
                 if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
                     change "NPM Database: Will clear old Lua snippets from $count proxy host(s) in Advanced tab."
                 else
@@ -564,18 +746,10 @@ configure_app_containers() {
     container_ids=$($DOCKER_CMD ps -a -q || true)
 
     # Find NPM container
-    npm_id=""
-    for cid in $container_ids; do
-        local img
-        img=$($DOCKER_CMD inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)
-        if echo "$img" | grep -q "nginx-proxy-manager"; then
-            npm_id="$cid"
-            break
-        fi
-    done
+    npm_id=$(find_npm_container_id)
 
     if [ -n "$npm_id" ]; then
-        npm_networks=$($DOCKER_CMD inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$npm_id" 2>/dev/null || true)
+        npm_networks=$($DOCKER_CMD inspect --format '{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' "$npm_id" 2>/dev/null || true)
     fi
 
     local any_unmanaged=false
@@ -585,13 +759,13 @@ configure_app_containers() {
 
         # Get container details via Go Template (including IPAddress)
         local details
-        details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}|{{if .Config.ExposedPorts}}{{range $k, $v := .Config.ExposedPorts}}{{$k}} {{end}}{{end}}|{{if .NetworkSettings.Ports}}{{range $k, $v := .NetworkSettings.Ports}}{{range $v}}{{.HostPort}} {{end}}{{end}}{{end}}|{{range $k, $v := .NetworkSettings.Networks}}{{$v.IPAddress}} {{end}}' "$cid" 2>/dev/null || true)
+        details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$cid" 2>/dev/null || true)
 
         [ -z "$details" ] && continue
 
         # Parse fields
-        local cname state restart network enabled domain idle start port_label compose_file svc_name networks exposed_ports published_ports ips
-        IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks exposed_ports published_ports ips <<< "$details"
+        local cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips
+        IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips <<< "$details"
         cname="${cname#/}"
 
         # Strip "<no value>" strings from labels (for older docker engines/podman)
@@ -602,6 +776,16 @@ configure_app_containers() {
         port_label="${port_label#<no value>}"
         compose_file="${compose_file#<no value>}"
         svc_name="${svc_name#<no value>}"
+
+        # Parse exposed and published ports from raw_ports
+        local exposed_ports="" published_ports=""
+        if [ -n "$raw_ports" ]; then
+            raw_ports="${raw_ports#<no value>}"
+            if [ -n "$raw_ports" ] && [ "$raw_ports" != "map[]" ]; then
+                exposed_ports=$(echo "$raw_ports" | grep -oE '[0-9]+/(tcp|udp)' | tr '\n' ' ' || echo "")
+                published_ports=$(echo "$raw_ports" | grep -oE '[0-9]+\}' | tr -d '}' | tr '\n' ' ' || echo "")
+            fi
+        fi
 
         # Skip already-configured containers
         if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
@@ -642,7 +826,7 @@ configure_app_containers() {
         
         # 1. Search in NPM SQLite database
         local matched_domain="" matched_port=""
-        find_npm_config_for_container "$cname" "$ips"
+        find_npm_config_for_container "$cname" "$ips" || true
         
         if [ -n "$matched_domain" ]; then
             default_domain="$matched_domain"
@@ -922,17 +1106,17 @@ run_install() {
     local npm_db="./data/database.sqlite"
     if [ -f "$npm_db" ]; then
         local npm_cid
-        npm_cid=$($DOCKER_CMD compose ps -q app 2>/dev/null || true)
-        [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD compose ps -q nginx-proxy-manager 2>/dev/null || true)
-        [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "name=nginx-proxy-manager" 2>/dev/null | head -n1)
-        [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "ancestor=jc21/nginx-proxy-manager" 2>/dev/null | head -n1)
+        npm_cid=$(find_npm_container_id)
         if [ -n "$npm_cid" ]; then
             local cleaned
-            cleaned=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
-                "UPDATE proxy_host
-                 SET    advanced_config = ''
-                 WHERE  advanced_config LIKE '%wakeonrequest%';
-                 SELECT changes();" 2>/dev/null || echo "0")
+            cleaned=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%';\"); conn.commit(); print(cursor.rowcount)" 2>/dev/null || true)
+            if [ -z "$cleaned" ]; then
+                cleaned=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
+                    "UPDATE proxy_host
+                     SET    advanced_config = ''
+                     WHERE  advanced_config LIKE '%wakeonrequest%';
+                     SELECT changes();" 2>/dev/null || echo "0")
+            fi
             if [ "$cleaned" != "0" ] && [ -n "$cleaned" ]; then
                 ok "Cleared old Lua snippets from $cleaned proxy host(s)."
             else
