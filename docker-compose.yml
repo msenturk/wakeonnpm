@@ -1,0 +1,123 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # Nginx Proxy Manager
+  # OpenResty-based reverse proxy with Lua support built in.
+  # wakeonrequest.lua runs inside this process — no sidecar needed.
+  # ---------------------------------------------------------------------------
+  npm:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+
+    ports:
+      - "80:80"     # HTTP
+      - "443:443"   # HTTPS
+      - "81:81"     # NPM admin UI
+
+    environment:
+      TZ: "Europe/Istanbul"
+      # DISABLE_IPV6: 'true'
+      # INITIAL_ADMIN_EMAIL: admin@example.com
+      # INITIAL_ADMIN_PASSWORD: changeme123
+      X_FRAME_OPTIONS: "sameorigin"
+
+    volumes:
+      # NPM persistent data
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+
+      # wakeonrequest — mounted read-only; edit on host, reload nginx to apply
+      - ./wakeonrequest.lua:/data/nginx/custom/wakeonrequest.lua
+      - ./http_top.conf:/data/nginx/custom/http_top.conf
+
+      # Docker socket — lets Lua call the Docker API directly
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    healthcheck:
+      test: ["CMD", "/usr/bin/check-health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    networks:
+      - proxy
+
+  # ---------------------------------------------------------------------------
+  # Managed app: Jellyfin
+  #
+  # Three labels control wakeonrequest behaviour — that's the entire config.
+  # No edits to http_top.conf or any other file needed.
+  # ---------------------------------------------------------------------------
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: "no"         # wakeonrequest owns the lifecycle, not Docker
+    expose:
+      - "8096"
+    labels:
+      wakeonrequest.enable: "true"
+      wakeonrequest.idle_timeout: "600"   # stop after 10 min idle
+      wakeonrequest.start_timeout: "45"   # jellyfin can be slow to start
+    volumes:
+      - ./jellyfin/config:/config
+      - ./jellyfin/cache:/cache
+      - /path/to/media:/media:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8096/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - proxy
+
+  # ---------------------------------------------------------------------------
+  # Managed app: Gitea
+  # ---------------------------------------------------------------------------
+  gitea:
+    image: gitea/gitea:latest
+    container_name: gitea
+    restart: "no"
+    expose:
+      - "3000"
+    labels:
+      wakeonrequest.enable: "true"
+      wakeonrequest.idle_timeout: "120"   # stop after 2 min idle
+      wakeonrequest.start_timeout: "20"
+    volumes:
+      - ./gitea:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - proxy
+
+  # ---------------------------------------------------------------------------
+  # Adding a new managed app is this simple — no other file needs editing:
+  #
+  # myapp:
+  #   image: myapp:latest
+  #   container_name: myapp
+  #   restart: "no"
+  #   expose:
+  #     - "8080"
+  #   labels:
+  #     wakeonrequest.enable: "true"
+  #     wakeonrequest.idle_timeout: "300"
+  #   networks:
+  #     - proxy
+  # ---------------------------------------------------------------------------
+
+networks:
+  proxy:
+    name: npm_proxy

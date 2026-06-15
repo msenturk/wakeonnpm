@@ -1,0 +1,20 @@
+# Backups
+*.bak.*
+
+# Test environments
+e2e-test/
+e2e_run.sh
+e2e_multi.sh
+
+# System/IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Local Node/Python if any
+node_modules/
+__pycache__/
+
+# Manual test runtime data
+manual-test/data/
+.serena
