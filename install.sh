@@ -27,8 +27,13 @@ FILES=(
 VOL_SOCK="/var/run/docker.sock:/var/run/docker.sock"
 
 # ── Colors ─────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'
-YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
+if [ -t 1 ]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'
+    YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; BLUE=''
+    YELLOW=''; BOLD=''; NC=''
+fi
 
 # ── Argument Parsing ───────────────────────────────────────────────────────────
 show_usage() {
@@ -98,6 +103,13 @@ done
 
 TARGET_DIR="${TARGET_DIR:-.}"
 
+if [ -n "$NPM_CONTAINER_OVERRIDE" ]; then
+    if [[ ! "$NPM_CONTAINER_OVERRIDE" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        echo -e "${RED}❌ Invalid container name: $NPM_CONTAINER_OVERRIDE${NC}"
+        exit 1
+    fi
+fi
+
 if [ ! -d "$TARGET_DIR" ]; then
     echo -e "${RED}❌ Directory not found: $TARGET_DIR${NC}"; exit 1
 fi
@@ -120,13 +132,18 @@ err()     { echo -e "  ${RED}❌ $1${NC}"; }
 backup_file() {
     local file=$1
     [ -f "$file" ] || return 0
-    local bak="${file}.bak.$(date +%Y%m%d_%H%M%S).$$"
+    local bak="${file}.bak.$(date +%Y%m%d_%H%M%S)_$RANDOM"
     cp "$file" "$bak"
     info "Backed up $file → $bak"
 }
 
 DOCKER_CMD="${DOCKER_CMD:-}"
+DOCKER_DETECT_RUN=false
 detect_docker_cli() {
+    if [ "$DOCKER_DETECT_RUN" = true ]; then
+        [ -n "$DOCKER_CMD" ] && return 0 || return 1
+    fi
+    DOCKER_DETECT_RUN=true
     if [ -n "$DOCKER_CMD" ]; then
         return 0
     fi
@@ -261,15 +278,14 @@ find_npm_container_id() {
         echo ""
         return
     fi
-    local npm_cid=""
     if [ -n "${NPM_CONTAINER_OVERRIDE:-}" ]; then
         npm_cid=$($DOCKER_CMD ps -q -f "name=${NPM_CONTAINER_OVERRIDE}" 2>/dev/null | head -n1)
         [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "id=${NPM_CONTAINER_OVERRIDE}" 2>/dev/null | head -n1)
         [ -z "$npm_cid" ] && npm_cid="$NPM_CONTAINER_OVERRIDE"
     else
         # Try local compose service first if in NPM directory
-        npm_cid=$($DOCKER_CMD compose ps -q app 2>/dev/null || true)
-        [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD compose ps -q nginx-proxy-manager 2>/dev/null || true)
+        npm_cid=$($DOCKER_CMD compose ps -q app 2>/dev/null) || { warn "Could not query compose app service"; npm_cid=""; }
+        [ -z "$npm_cid" ] && { npm_cid=$($DOCKER_CMD compose ps -q nginx-proxy-manager 2>/dev/null) || { warn "Could not query compose nginx-proxy-manager service"; npm_cid=""; }; }
         
         # Fallback to scanning all containers
         if [ -z "$npm_cid" ]; then
@@ -292,16 +308,16 @@ fetch_npm_proxy_hosts() {
     local npm_cid
     npm_cid=$(find_npm_container_id)
     if [ -n "$npm_cid" ]; then
-        NPM_PROXY_HOSTS=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute('SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;'); [print(f\"{row[0]}|{row[1]}|{row[2]}\") for row in cursor.fetchall()]" 2>/dev/null || true)
+        NPM_PROXY_HOSTS=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute('SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;'); [print(f\"{row[0]}|{row[1]}|{row[2]}\") for row in cursor.fetchall()]" 2>/dev/null) || NPM_PROXY_HOSTS=""
         if [ -z "$NPM_PROXY_HOSTS" ]; then
             NPM_PROXY_HOSTS=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
-                "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null || echo "")
+                "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null) || { warn "Failed to query SQLite DB inside container $npm_cid. Check permissions."; NPM_PROXY_HOSTS=""; }
         fi
     fi
     if [ -z "$NPM_PROXY_HOSTS" ] && [ -f "./data/database.sqlite" ]; then
-        NPM_PROXY_HOSTS=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute('SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;'); [print(f\"{row[0]}|{row[1]}|{row[2]}\") for row in cursor.fetchall()]" 2>/dev/null || true)
+        NPM_PROXY_HOSTS=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute('SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;'); [print(f\"{row[0]}|{row[1]}|{row[2]}\") for row in cursor.fetchall()]" 2>/dev/null) || NPM_PROXY_HOSTS=""
         if [ -z "$NPM_PROXY_HOSTS" ]; then
-            NPM_PROXY_HOSTS=$(sqlite3 ./data/database.sqlite "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null || echo "")
+            NPM_PROXY_HOSTS=$(sqlite3 ./data/database.sqlite "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null) || { warn "Failed to query local SQLite DB. Check permissions."; NPM_PROXY_HOSTS=""; }
         fi
     fi
 }
@@ -372,15 +388,15 @@ count_old_snippets() {
     local npm_cid
     npm_cid=$(find_npm_container_id)
     if [ -n "$npm_cid" ] && $DOCKER_CMD exec "$npm_cid" test -f /data/database.sqlite >/dev/null 2>&1; then
-        count=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';\"); print(cursor.fetchone()[0])" 2>/dev/null || true)
+        count=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';\"); print(cursor.fetchone()[0])" 2>/dev/null) || count=""
         if [ -z "$count" ]; then
             count=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
-                "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null || echo "")
+                "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null) || { warn "Failed to query SQLite DB inside container $npm_cid."; count=""; }
         fi
     elif [ -f "./data/database.sqlite" ]; then
-        count=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';\"); print(cursor.fetchone()[0])" 2>/dev/null || true)
+        count=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';\"); print(cursor.fetchone()[0])" 2>/dev/null) || count=""
         if [ -z "$count" ]; then
-            count=$(sqlite3 ./data/database.sqlite "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null || echo "")
+            count=$(sqlite3 ./data/database.sqlite "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null) || { warn "Failed to query local SQLite DB."; count=""; }
         fi
     fi
     echo "$count"
@@ -391,15 +407,15 @@ clear_old_snippets() {
     local npm_cid
     npm_cid=$(find_npm_container_id)
     if [ -n "$npm_cid" ] && $DOCKER_CMD exec "$npm_cid" test -f /data/database.sqlite >/dev/null 2>&1; then
-        cleaned=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%';\"); conn.commit(); print(cursor.rowcount)" 2>/dev/null || true)
+        cleaned=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%';\"); conn.commit(); print(cursor.rowcount)" 2>/dev/null) || cleaned=""
         if [ -z "$cleaned" ]; then
             cleaned=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
-                "UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%'; SELECT changes();" 2>/dev/null || echo "0")
+                "UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%'; SELECT changes();" 2>/dev/null) || { warn "Failed to update SQLite DB inside container $npm_cid."; cleaned="0"; }
         fi
     elif [ -f "./data/database.sqlite" ]; then
-        cleaned=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%';\"); conn.commit(); print(cursor.rowcount)" 2>/dev/null || true)
+        cleaned=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%';\"); conn.commit(); print(cursor.rowcount)" 2>/dev/null) || cleaned=""
         if [ -z "$cleaned" ]; then
-            cleaned=$(sqlite3 ./data/database.sqlite "UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%'; SELECT changes();" 2>/dev/null || echo "0")
+            cleaned=$(sqlite3 ./data/database.sqlite "UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%'; SELECT changes();" 2>/dev/null) || { warn "Failed to update local SQLite DB."; cleaned="0"; }
         fi
     else
         cleaned=""
@@ -469,8 +485,8 @@ resolve_compose_file() {
 
     # Try mounts
     if [ -n "$mounts" ]; then
-        local IFS='?'
-        for mnt in $mounts; do
+        IFS='?' read -r -a mounts_array <<< "$mounts"
+        for mnt in "${mounts_array[@]}"; do
             [ -z "$mnt" ] && continue
             
             # Skip docker volumes
@@ -586,12 +602,102 @@ print("|".join(f.replace("|", "▒") for f in fields))
 PYEOF
 }
 
- ──────────────────────────────────────────────────────
+parse_container_details() {
+    local details="$1"
+    local npm_id="$2"
+    local npm_networks="$3"
+
+    IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks exposed_ports published_ports ips long_id mounts <<< "$details"
+
+    local is_npm=false
+    if [ -n "$npm_id" ]; then
+        if [ "$long_id" = "$npm_id" ] || [ "${long_id:0:12}" = "$npm_id" ] || [ "$cname" = "/$npm_id" ]; then
+            is_npm=true
+        fi
+    fi
+    [ "$is_npm" = true ] && return 1
+
+    compose_path=$(resolve_compose_file "$compose_file" "$working_dir" "$mounts")
+    exposed_ports=$(echo "$exposed_ports" | xargs)
+    published_ports=$(echo "$published_ports" | xargs)
+    ips=$(echo "$ips" | xargs)
+
+    local exp_count pub_count
+    exp_count=$(echo "$exposed_ports" | wc -w)
+    pub_count=$(echo "$published_ports" | wc -w)
+
+    single_exposed=""
+    [ "$exp_count" -eq 1 ] && single_exposed="${exposed_ports%%/*}"
+
+    single_published=""
+    [ "$pub_count" -eq 1 ] && single_published="${published_ports}"
+
+    matched_domain=""
+    matched_port=""
+    matched_fwd_host=""
+    matched_access_type=""
+    find_npm_config_for_container "$cname" "$ips" "$published_ports" || true
+
+    detected_port=""
+    port_source=""
+    if [ -n "$port_label" ]; then
+        detected_port="$port_label"; port_source="from label"
+    elif [ -n "$matched_port" ]; then
+        detected_port="$matched_port"; port_source="from NPM database"
+    elif [ -n "$single_exposed" ]; then
+        detected_port="$single_exposed"; port_source="auto-detected"
+    elif [ -n "$single_published" ]; then
+        detected_port="$single_published"; port_source="published port"
+    fi
+
+    shares_network=false
+    for net in $npm_networks; do
+        for cnet in $networks; do
+            if [ "$net" = "$cnet" ]; then
+                shares_network=true
+                break 2
+            fi
+        done
+    done
+
+    fwd_host=""
+    fwd_note=""
+    if [ -n "$matched_fwd_host" ]; then
+        fwd_host="$matched_fwd_host"
+        if [ "$matched_access_type" = "name" ]; then
+            fwd_note="NPM database config — accesses via container name"
+            port_source="from NPM database"
+        else
+            fwd_note="NPM database config — accesses via IP"
+            port_source="from NPM database"
+        fi
+    elif [ "$network" = "host" ]; then
+        fwd_host=$(detect_host_ip)
+        fwd_note="host network — NPM cannot route by name"
+    elif [ "$shares_network" = "true" ]; then
+        fwd_host="$cname"
+        fwd_note="same network as NPM — use container name"
+    else
+        fwd_host=$(detect_host_ip)
+        fwd_note="different network from NPM — use host IP"
+    fi
+
+    restart_needed=false
+    if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+        restart_needed=true
+    fi
+
+    return 0
+}
+
+# ──────────────────────────────────────────────────────
 # server_proxy.conf is not hosted on GitHub — it is embedded here instead.
 # Called by both run_dry_run (for missing files) and run_install (as fallback).
 write_bundled_files() {
     local target="npm-custom/server_proxy.conf"
-    [ -f "$target" ] && return 0   # already present, nothing to do
+    if [ -f "$target" ]; then
+        backup_file "$target"
+    fi
     mkdir -p npm-custom
     cat > "$target" << 'EOF'
 # ── Wake-On-Request: Global Interceptor ──────────────────────────────────────
@@ -663,8 +769,7 @@ run_dry_run() {
     section "Container Label Status"
     if has_docker; then
         fetch_npm_proxy_hosts
-        local container_ids npm_id npm_networks
-        container_ids=$($DOCKER_CMD ps -a -q || true)
+        local npm_id npm_networks
         
         # Find NPM container
         npm_id=$(find_npm_container_id)
@@ -673,39 +778,19 @@ run_dry_run() {
             npm_networks=$($DOCKER_CMD inspect --format '{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' "$npm_id" 2>/dev/null || true)
         fi
 
-        if [ -n "$container_ids" ]; then
-            for cid in $container_ids; do
+        while IFS= read -r cid || [ -n "$cid" ]; do
+                [ -z "$cid" ] && continue
                 local details
                 details=$(inspect_container_python "$cid")
                 [ -z "$details" ] && continue
 
-                # Parse fields (produced cleanly by Python)
-                local cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks exposed_ports published_ports ips long_id mounts
-                IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks exposed_ports published_ports ips long_id mounts <<< "$details"
-
-                local is_npm=false
-                if [ -n "$npm_id" ]; then
-                    if [ "$long_id" = "$npm_id" ] || [ "${long_id:0:12}" = "$npm_id" ] || [ "$cname" = "/$npm_id" ]; then
-                        is_npm=true
-                    fi
-                fi
-                [ "$is_npm" = true ] && continue
-
-                # No <no value> cleanup needed — Python returns empty strings
-
-                local compose_path
-                compose_path=$(resolve_compose_file "$compose_file" "$working_dir" "$mounts")
-
-                # Trim whitespace from port/ip lists (Python may have trailing spaces)
-                exposed_ports=$(echo "$exposed_ports" | xargs)
-                published_ports=$(echo "$published_ports" | xargs)
-                ips=$(echo "$ips" | xargs)
+                parse_container_details "$details" "$npm_id" "$npm_networks" || continue
 
                 # ── Already configured ─────────────────────────────────────
                 if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
                     idle="${idle:-300}"
                     start="${start:-30}"
-                    if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+                    if [ "$restart_needed" = true ]; then
                         warn "${BOLD}$cname${NC}${YELLOW}  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
                         err "      restart: \"$restart\" prevents idle stop → must be changed to \"no\" manually in docker-compose.yml"
                     else
@@ -720,72 +805,7 @@ run_dry_run() {
                 fi
 
                 # ── Not yet configured — detect everything ─────────────────
-
-                local exp_count pub_count
-                exp_count=$(echo "$exposed_ports" | wc -w)
-                pub_count=$(echo "$published_ports" | wc -w)
-
-                local single_exposed=""
-                [ "$exp_count" -eq 1 ] && single_exposed="${exposed_ports%%/*}"
-
-                local single_published=""
-                [ "$pub_count" -eq 1 ] && single_published="${published_ports}"
-
-                local matched_domain="" matched_port="" matched_fwd_host="" matched_access_type=""
-                find_npm_config_for_container "$cname" "$ips" "$published_ports" || true
-
-                local detected_port="" port_source=""
-                if [ -n "$port_label" ]; then
-                    detected_port="$port_label"; port_source="from label"
-                elif [ -n "$matched_port" ]; then
-                    detected_port="$matched_port"; port_source="from NPM database"
-                elif [ -n "$single_exposed" ]; then
-                    detected_port="$single_exposed"; port_source="auto-detected"
-                elif [ -n "$single_published" ]; then
-                    detected_port="$single_published"; port_source="published port"
-                fi
-
-                # Determine if this container shares a network with NPM
-                local shares_network=false
-                for net in $npm_networks; do
-                    for cnet in $networks; do
-                        if [ "$net" = "$cnet" ]; then
-                            shares_network=true
-                            break 2
-                        fi
-                    done
-                done
-
-                # Decide Forward Host recommendation
-                local fwd_host fwd_port fwd_note restart_needed
-                if [ -n "$matched_fwd_host" ]; then
-                    fwd_host="$matched_fwd_host"
-                    fwd_port="$matched_port"
-                    if [ "$matched_access_type" = "name" ]; then
-                        fwd_note="NPM database config — accesses via container name"
-                        port_source="from NPM database"
-                    else
-                        fwd_note="NPM database config — accesses via IP"
-                        port_source="from NPM database"
-                    fi
-                elif [ "$network" = "host" ]; then
-                    fwd_host=$(detect_host_ip)
-                    fwd_port="${single_published:-<port>}"
-                    fwd_note="host network — NPM cannot route by name"
-                elif [ "$shares_network" = "true" ]; then
-                    fwd_host="$cname"
-                    fwd_port="${detected_port:-<port>}"
-                    fwd_note="same network as NPM — use container name"
-                else
-                    fwd_host=$(detect_host_ip)
-                    fwd_port="${single_published:-<port>}"
-                    fwd_note="different network from NPM — use host IP"
-                fi
-
-                restart_needed=false
-                if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
-                    restart_needed=true
-                fi
+                [ -z "$fwd_port" ] && fwd_port="<port>"
 
                 # ── Print tailored block ──────────────────────────────────────────
                 local status_tag="state: $state | restart: $restart"
@@ -871,8 +891,7 @@ run_dry_run() {
                     echo -e "     ${GREEN}set \$wake_port          ${fwd_port:-80};${NC}    ${BLUE}# cross-network probe port${NC}"
                 fi
                 echo ""
-            done
-        fi
+        done < <($DOCKER_CMD ps -a -q 2>/dev/null)
     else
         warn "Docker socket or daemon not available — skipping container scan."
     fi
@@ -924,8 +943,7 @@ configure_app_containers() {
 
     fetch_npm_proxy_hosts
 
-    local container_ids npm_id npm_networks
-    container_ids=$($DOCKER_CMD ps -a -q || true)
+    local npm_id npm_networks
 
     # Find NPM container
     npm_id=$(find_npm_container_id)
@@ -936,8 +954,8 @@ configure_app_containers() {
 
     local any_unmanaged=false
 
-    if [ -n "$container_ids" ]; then
-        for cid in $container_ids; do
+    while IFS= read -r cid || [ -n "$cid" ]; do
+            [ -z "$cid" ] && continue
             local details
             details=$(inspect_container_python "$cid")
             [ -z "$details" ] && continue
@@ -1204,14 +1222,58 @@ configure_app_containers() {
                 # ── Apply changes ──────────────────────────────────────────────────
                 if grep -qF "wakeonrequest.enable" "$compose_path"; then
                     warn "wakeonrequest labels already present in $compose_path — skipping write."
-                elif grep -A50 "${svc_name}:" "$compose_path" | grep -qE "^[[:space:]]+labels:"; then
-                    backup_file "$compose_path"
-                    sed -i "/^[[:space:]]*labels:/a \\${append_content}" "$compose_path"
-                    ok "Labels appended to existing labels: block in $compose_path"
                 else
                     backup_file "$compose_path"
-                    sed -i "/^[[:space:]]*${svc_name}:/a \\${label_block}" "$compose_path"
-                    ok "Labels added to $compose_path"
+                    local patch_mode="insert"
+                    local patch_content="$label_block"
+                    if grep -A50 "^[[:space:]]*${svc_name}:" "$compose_path" | grep -qE "^[[:space:]]+labels:"; then
+                        patch_mode="append"
+                        patch_content="$append_content"
+                    fi
+
+                    python3 - "$compose_path" "$svc_name" "$patch_content" "$patch_mode" << 'PYEOF'
+import sys, re
+
+c_path, svc, content, mode = sys.argv[1:5]
+content_lines = content.split(r"\n")
+
+with open(c_path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+out = []
+in_svc = False
+patched = False
+
+for line in lines:
+    out.append(line)
+    if patched:
+        continue
+        
+    line_clean = line.rstrip("\r\n")
+    if re.match(r"^\s*" + re.escape(svc) + r":\s*$", line_clean):
+        in_svc = True
+        if mode == "insert":
+            for cl in content_lines:
+                out.append(cl + ("\r\n" if line.endswith("\r\n") else "\n"))
+            patched = True
+            in_svc = False
+        continue
+        
+    if in_svc and mode == "append":
+        if re.match(r"^\s*labels:\s*", line_clean):
+            for cl in content_lines:
+                out.append(cl + ("\r\n" if line.endswith("\r\n") else "\n"))
+            patched = True
+            in_svc = False
+
+with open(c_path, "w", encoding="utf-8", newline="") as f:
+    f.writelines(out)
+PYEOF
+                    if [ "$patch_mode" = "append" ]; then
+                        ok "Labels appended to existing labels: block in $compose_path"
+                    else
+                        ok "Labels added to $compose_path"
+                    fi
                 fi
 
                 if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
@@ -1250,8 +1312,7 @@ configure_app_containers() {
         echo ""
         info "Then run: docker compose up -d --force-recreate $cname"
 
-        done <<< "$inspect_data"
-    fi
+    done < <($DOCKER_CMD ps -a -q 2>/dev/null)
 
     if [ "$any_unmanaged" = false ]; then
         ok "All containers are already configured."

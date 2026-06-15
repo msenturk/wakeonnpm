@@ -400,9 +400,10 @@ class DockerClient:
 class NpmDatabase:
     """Reads and writes the NPM SQLite database."""
 
-    def __init__(self, docker: DockerClient, target_dir: Path) -> None:
+    def __init__(self, docker: DockerClient, target_dir: Path, db_override: Optional[Path] = None) -> None:
         self._docker = docker
         self._target = target_dir
+        self._db_override = db_override  # explicit sqlite file path from --path
         self._proxy_hosts: list[dict] = []  # [{domain_names, forward_host, forward_port}]
         self._fetched = False
 
@@ -415,8 +416,15 @@ class NpmDatabase:
             return []
 
     def _local_db(self) -> Optional[Path]:
-        p = self._target / "data" / "database.sqlite"
-        return p if p.exists() else None
+        if self._db_override and self._db_override.exists():
+            return self._db_override
+        for candidate in (
+            self._target / "database.sqlite",
+            self._target / "data" / "database.sqlite",
+        ):
+            if candidate.exists():
+                return candidate
+        return None
 
     def _query_local(self, sql: str, params: tuple = ()) -> list[tuple]:
         db = self._local_db()
@@ -922,28 +930,29 @@ def run_dry_run(
             Console.ok(f"Exists    {local_path}")
 
     # ── docker-compose.yml volumes ─────────────────────────────────────────────
-    Console.section("docker-compose.yml — Volume Changes")
-    patcher = ComposePatcher(Path("docker-compose.yml"))
-    compose_clean = True
-    for local_path, container_path in FILES:
-        vol = f"./{local_path}:{container_path}"
-        if not patcher.has_volume(vol):
-            Console.change(f"ADD  - {vol}")
+    if Path("docker-compose.yml").exists():
+        Console.section("docker-compose.yml — Volume Changes")
+        patcher = ComposePatcher(Path("docker-compose.yml"))
+        compose_clean = True
+        for local_path, container_path in FILES:
+            vol = f"./{local_path}:{container_path}"
+            if not patcher.has_volume(vol):
+                Console.change(f"ADD  - {vol}")
+                compose_clean = False
+                any_change = True
+            else:
+                Console.ok(f"OK   - {vol}")
+
+        if not patcher.has_volume(VOL_SOCK):
+            Console.change(f"ADD  - {VOL_SOCK}")
             compose_clean = False
             any_change = True
         else:
-            Console.ok(f"OK   - {vol}")
+            Console.ok(f"OK   - {VOL_SOCK}")
 
-    if not patcher.has_volume(VOL_SOCK):
-        Console.change(f"ADD  - {VOL_SOCK}")
-        compose_clean = False
-        any_change = True
-    else:
-        Console.ok(f"OK   - {VOL_SOCK}")
-
-    if not compose_clean:
-        print()
-        Console.info("These lines will be inserted under your NPM service's 'volumes:' block.")
+        if not compose_clean:
+            print()
+            Console.info("These lines will be inserted under your NPM service's 'volumes:' block.")
 
     # ── Container Label Status ─────────────────────────────────────────────────
     Console.section("Container Label Status")
@@ -1307,7 +1316,7 @@ def run_install(
         if local_path == "npm-custom/server_proxy.conf":
             continue  # already written above
 
-        remote_url = f"{RAW_BASE}/{p.name}"
+        remote_url = f"{RAW_BASE}/{local_path}"
         _backup_file(p)
         print(f"  Downloading {Console.bold(local_path)} ... ", end="", flush=True)
         try:
@@ -1447,24 +1456,36 @@ def main() -> None:
         show_usage(parser)
         sys.exit(0)
 
-    # Resolve target directory
+    # Resolve target directory — accept either a dir or a .sqlite file
     target_dir_str = args.path or args.target_dir or "."
-    target_dir = Path(target_dir_str).resolve()
+    target_path = Path(target_dir_str).resolve()
+    db_override: Optional[Path] = None
 
-    if not target_dir.is_dir():
-        print(f"{Console.red(f'❌ Directory not found: {target_dir}')}")
+    if target_path.is_file() and target_path.suffix in (".sqlite", ".db", ".sqlite3"):
+        # User passed the database file directly
+        db_override = target_path
+        target_dir = target_path.parent
+    elif target_path.is_dir():
+        target_dir = target_path
+    else:
+        print(f"{Console.red('❌ Path not found: ' + str(target_path))}")
+        print("   Pass a directory (e.g. /path/to/npm-data) or the database file directly.")
         sys.exit(1)
 
     os.chdir(target_dir)
 
-    if not Path("docker-compose.yml").exists():
-        print(Console.red(f"❌ docker-compose.yml not found in {target_dir}"))
-        print("   Run this script from your Nginx Proxy Manager directory.")
-        sys.exit(1)
+    # docker-compose.yml check — skip in dry-run if user only supplied the DB path
+    if not db_override and not Path("docker-compose.yml").exists():
+        if args.dry_run:
+            Console.warn("docker-compose.yml not found — compose patching will be skipped.")
+        else:
+            print(Console.red(f"❌ docker-compose.yml not found in {target_dir}"))
+            print("   Run this script from your Nginx Proxy Manager directory.")
+            sys.exit(1)
 
     # Build clients
     docker = DockerClient(npm_override=args.npm or "")
-    db = NpmDatabase(docker, target_dir)
+    db = NpmDatabase(docker, target_dir, db_override=db_override)
 
     # Environment scan
     Console.section("Environment Scan")
