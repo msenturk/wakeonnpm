@@ -230,36 +230,61 @@ end
 -- @param timeout number (optional): Socket timeout in milliseconds
 -- @return status_code number|nil, body string, err string|nil
 local function docker_request(method, path, body, timeout)
-    local http = require("resty.http")
-    local httpc = http.new()
-    httpc:set_timeout(timeout or 15000)
+    local sock = ngx.socket.tcp()
+    sock:settimeout(timeout or 15000)
 
-    local ok, err = httpc:connect("unix:" .. _M.DOCKER_SOCKET)
+    local ok, err = sock:connect("unix:" .. _M.DOCKER_SOCKET)
     if not ok then return nil, "", "socket connect: " .. (err or "?") end
 
-    local req_params = {
-        path = path,
-        method = method,
-        headers = {
-            ["Host"] = "localhost"
-        }
-    }
-    
+    local extra_headers = ""
+    local payload = body or ""
     if body then
-        req_params.body = body
-        req_params.headers["Content-Type"] = "application/json"
+        extra_headers = "Content-Length: " .. #payload .. "\r\nContent-Type: application/json\r\n"
     end
 
-    local res, req_err = httpc:request(req_params)
-    if not res then 
-        httpc:close()
-        return nil, "", "request err: " .. (req_err or "?") 
+    local req = method .. " " .. path .. " HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n" .. extra_headers .. "\r\n" .. payload
+    local _, werr = sock:send(req)
+    if werr then sock:close(); return nil, "", "socket send: " .. werr end
+
+    local status_line = sock:receive("*l")
+    if not status_line then sock:close(); return nil, "", "no response" end
+    local code = tonumber(status_line:match("HTTP/%d%.%d (%d+)"))
+
+    local headers = {}
+    while true do
+        local line = sock:receive("*l")
+        if not line or line == "" then break end
+        -- Fix \r bug by stripping trailing whitespace
+        local k, v = line:match("^([^:]+):%s*(.-)%s*$")
+        if k then headers[k:lower()] = v:lower() end
     end
 
-    local resp_body, read_err = res:read_body()
-    httpc:close()
+    local resp = ""
+    local is_chunked = headers["transfer-encoding"] == "chunked"
+    local len = tonumber(headers["content-length"])
 
-    return res.status, resp_body or "", nil
+    if is_chunked then
+        local chunks = {}
+        while true do
+            local chunk_len_str = sock:receive("*l")
+            if not chunk_len_str then break end
+            local chunk_len = tonumber(chunk_len_str:match("^(%x+)"), 16)
+            if not chunk_len or chunk_len == 0 then break end
+            
+            local chunk_data = sock:receive(chunk_len)
+            if chunk_data then table.insert(chunks, chunk_data) end
+            sock:receive(2) -- read trailing \r\n
+        end
+        resp = table.concat(chunks)
+    elseif len and len > 0 then
+        resp = sock:receive(len) or ""
+    else
+        local data, _, partial = sock:receive("*a")
+        resp = data or partial or ""
+    end
+
+    sock:close()
+    return code, resp, nil
 end
 
 -- ── Container introspection ───────────────────────────────────────────────────
