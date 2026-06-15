@@ -248,6 +248,158 @@ print(cursor.fetchone()[0])
     cleanup_test_env
 }
 
+# --- Test 9: Container Inspection Parsing ---
+test_container_inspection() {
+    echo -e "\n${BLUE}🧪 Test 9: Container Inspection Parsing${NC}"
+    setup_test_env
+    
+    cat << 'EOF' > docker-compose.yml
+services:
+  npm:
+    image: jc21/nginx-proxy-manager
+EOF
+
+    # Create mock docker command
+    cat << 'EOF' > mock_docker.sh
+#!/bin/bash
+if [ "$1" = "ps" ]; then
+    echo "12345"
+elif [ "$1" = "inspect" ]; then
+    echo "mock_container|running|no|bridge|true|mock.example.com|300|30|||||112233|||12345|"
+else
+    true
+fi
+EOF
+    chmod +x mock_docker.sh
+    export DOCKER_CMD="$(pwd)/mock_docker.sh"
+
+    # Run dry-run and verify parsing
+    if ! "$INSTALLER_PATH" --dry-run | grep -q "mock_container"; then
+        echo -e "${RED}❌ FAILED: Did not parse container name${NC}"
+        exit 1
+    fi
+    if ! "$INSTALLER_PATH" --dry-run | grep -q "mock.example.com"; then
+        echo -e "${RED}❌ FAILED: Did not parse domain${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✅ PASSED: Container Inspection Parsing.${NC}"
+    export DOCKER_CMD="true"
+    cleanup_test_env
+}
+
+# --- Test 10: resolve_compose_file Fallbacks (Mounts) ---
+test_resolve_compose_file_fallback() {
+    echo -e "\n${BLUE}🧪 Test 10: resolve_compose_file Fallbacks (Mounts)${NC}"
+    setup_test_env
+    
+    cat << 'EOF' > docker-compose.yml
+services:
+  npm:
+    image: jc21/nginx-proxy-manager
+EOF
+
+    # Setup mock mount directory
+    mkdir -p mock_mount_dir
+    touch mock_mount_dir/docker-compose.yml
+
+    # Create mock docker command
+    cat << EOF > mock_docker.sh
+#!/bin/bash
+if [ "\$1" = "ps" ]; then
+    echo "12345"
+elif [ "\$1" = "inspect" ]; then
+    echo "mock_container|running|no|bridge|false|||||docker-compose.yml||||||12345|$(pwd)/mock_mount_dir/data?"
+else
+    true
+fi
+EOF
+    chmod +x mock_docker.sh
+    export DOCKER_CMD="$(pwd)/mock_docker.sh"
+
+    # Run dry-run and verify it found the compose file in mock_mount_dir
+    if ! "$INSTALLER_PATH" --dry-run | grep -q "mock_mount_dir/docker-compose.yml"; then
+        echo -e "${RED}❌ FAILED: Did not resolve compose file using mounts fallback${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✅ PASSED: resolve_compose_file Fallbacks (Mounts).${NC}"
+    export DOCKER_CMD="true"
+    cleanup_test_env
+}
+
+# --- Test 11: Restart Policy Validation ---
+test_restart_policy_validation() {
+    echo -e "\n${BLUE}🧪 Test 11: Restart Policy Validation${NC}"
+    setup_test_env
+    
+    cat << 'EOF' > docker-compose.yml
+services:
+  npm:
+    image: jc21/nginx-proxy-manager
+EOF
+
+    # Create mock docker command
+    cat << 'EOF' > mock_docker.sh
+#!/bin/bash
+if [ "$1" = "ps" ]; then
+    echo "12345"
+elif [ "$1" = "inspect" ]; then
+    echo "mock_container|running|always|bridge|true|mock.example.com||||||||||12345|"
+else
+    true
+fi
+EOF
+    chmod +x mock_docker.sh
+    export DOCKER_CMD="$(pwd)/mock_docker.sh"
+
+    # Run dry-run and verify warning
+    if ! "$INSTALLER_PATH" --dry-run | grep -q 'restart: "always" prevents idle stop'; then
+        echo -e "${RED}❌ FAILED: Did not warn about restart policy${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✅ PASSED: Restart Policy Validation.${NC}"
+    export DOCKER_CMD="true"
+    cleanup_test_env
+}
+
+# --- Test 12: Missing Domain Verification ---
+test_missing_domain_verification() {
+    echo -e "\n${BLUE}🧪 Test 12: Missing Domain Verification${NC}"
+    setup_test_env
+    
+    cat << 'EOF' > docker-compose.yml
+services:
+  npm:
+    image: jc21/nginx-proxy-manager
+EOF
+
+    # Create mock docker command
+    cat << 'EOF' > mock_docker.sh
+#!/bin/bash
+if [ "$1" = "ps" ]; then
+    echo "12345"
+elif [ "$1" = "inspect" ]; then
+    echo "mock_container|running|no|bridge|true|||||||||||12345|"
+else
+    true
+fi
+EOF
+    chmod +x mock_docker.sh
+    export DOCKER_CMD="$(pwd)/mock_docker.sh"
+
+    # Run dry-run and verify warning
+    if ! "$INSTALLER_PATH" --dry-run | grep -q 'MISSING wakeonrequest.domain label'; then
+        echo -e "${RED}❌ FAILED: Did not warn about missing domain${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}✅ PASSED: Missing Domain Verification.${NC}"
+    export DOCKER_CMD="true"
+    cleanup_test_env
+}
+
 # --- Run All Tests ---
 echo -e "${BLUE}🏁 Starting Test Suite...${NC}"
 test_fail_no_compose
@@ -258,5 +410,9 @@ test_help_argument
 test_invalid_path_flag
 test_dry_run_preview
 test_database_cleanup
+test_container_inspection
+test_resolve_compose_file_fallback
+test_restart_policy_validation
+test_missing_domain_verification
 
 echo -e "\n${GREEN}🌟 ALL TESTS PASSED SUCCESSFULLY!${NC}\n"

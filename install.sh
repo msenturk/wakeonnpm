@@ -419,6 +419,101 @@ scan_docker_environment() {
     ok "Environment scan complete."
 }
 
+resolve_compose_file() {
+    local compose_file="$1"
+    local working_dir="$2"
+    local mounts="$3"
+
+    local c_file="${compose_file:-}"
+    
+    # If c_file is relative, and working_dir is set, combine them
+    if [ -n "$c_file" ] && [ -n "$working_dir" ]; then
+        if [[ ! "$c_file" =~ ^/ ]] && [[ ! "$c_file" =~ ^[a-zA-Z]: ]]; then
+            c_file="${working_dir}/${c_file}"
+        fi
+    fi
+
+    # Convert Windows to WSL if needed
+    if [ -n "$c_file" ]; then
+        c_file="${c_file//\\//}"
+        if [[ "$c_file" =~ ^[a-zA-Z]:/ ]]; then
+            c_file=$(wslpath -u "$c_file" 2>/dev/null || echo "$c_file")
+        fi
+    fi
+
+    # If it exists, return it
+    if [ -n "$c_file" ] && [ -f "$c_file" ]; then
+        echo "$c_file"
+        return
+    fi
+
+    # Try searching common names if not absolute
+    local search_names="docker-compose.yml docker-compose.yaml compose.yml compose.yaml"
+    if [ -n "$compose_file" ] && [[ ! "$compose_file" =~ ^/ ]] && [[ ! "$compose_file" =~ ^[a-zA-Z]: ]]; then
+        search_names="$compose_file $search_names"
+    fi
+
+    # Try working_dir
+    if [ -n "$working_dir" ]; then
+        local wdir="${working_dir//\\//}"
+        if [[ "$wdir" =~ ^[a-zA-Z]:/ ]]; then
+            wdir=$(wslpath -u "$wdir" 2>/dev/null || echo "$wdir")
+        fi
+        for name in $search_names; do
+            if [ -f "${wdir}/${name}" ]; then
+                echo "${wdir}/${name}"
+                return
+            fi
+        done
+    fi
+
+    # Try mounts
+    if [ -n "$mounts" ]; then
+        local IFS='?'
+        for mnt in $mounts; do
+            [ -z "$mnt" ] && continue
+            
+            # Skip docker volumes
+            if [[ "$mnt" =~ /var/lib/docker/volumes ]] || [[ "$mnt" =~ /containers/storage/volumes ]]; then
+                continue
+            fi
+
+            local mnt_wsl="${mnt//\\//}"
+            if [[ "$mnt_wsl" =~ ^[a-zA-Z]:/ ]]; then
+                mnt_wsl=$(wslpath -u "$mnt_wsl" 2>/dev/null || echo "$mnt_wsl")
+            fi
+
+            # Start from the mount path and go up to 3 parent directories
+            local curr="$mnt_wsl"
+            if [ -f "$curr" ]; then
+                curr=$(dirname "$curr")
+            fi
+
+            local depth=0
+            while [ -n "$curr" ] && [ "$curr" != "/" ] && [ "$curr" != "." ] && [ $depth -lt 4 ]; do
+                for name in $search_names; do
+                    if [ -f "${curr}/${name}" ]; then
+                        echo "${curr}/${name}"
+                        return
+                    fi
+                done
+                curr=$(dirname "$curr")
+                depth=$((depth + 1))
+            done
+        done
+    fi
+
+    # If nothing found, return original but translated
+    local fallback="$compose_file"
+    if [ -n "$fallback" ]; then
+        fallback="${fallback//\\//}"
+        if [[ "$fallback" =~ ^[a-zA-Z]:/ ]]; then
+            fallback=$(wslpath -u "$fallback" 2>/dev/null || echo "$fallback")
+        fi
+    fi
+    echo "$fallback"
+}
+
 # ── Bundled file fallback ──────────────────────────────────────────────────────
 # server_proxy.conf is not hosted on GitHub — it is embedded here instead.
 # Called by both run_dry_run (for missing files) and run_install (as fallback).
@@ -508,14 +603,14 @@ run_dry_run() {
 
         if [ -n "$container_ids" ]; then
             local inspect_data
-            inspect_data=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{.Id}}' $container_ids 2>/dev/null || true)
+            inspect_data=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.working_dir"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{.Id}}|{{range .Mounts}}{{.Source}}?{{end}}' $container_ids 2>/dev/null || true)
 
             while IFS= read -r details; do
                 [ -z "$details" ] && continue
 
                 # Parse fields
-                local cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips long_id
-                IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips long_id <<< "$details"
+                local cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks raw_ports ips long_id mounts
+                IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks raw_ports ips long_id mounts <<< "$details"
 
                 local is_npm=false
                 if [ -n "$npm_id" ]; then
@@ -534,7 +629,11 @@ run_dry_run() {
             start="${start#<no value>}"
             port_label="${port_label#<no value>}"
             compose_file="${compose_file#<no value>}"
+            working_dir="${working_dir#<no value>}"
             svc_name="${svc_name#<no value>}"
+
+            local compose_path
+            compose_path=$(resolve_compose_file "$compose_file" "$working_dir" "$mounts")
 
             # Parse exposed and published ports from raw_ports
             local exposed_ports="" published_ports=""
@@ -651,15 +750,6 @@ run_dry_run() {
             restart_needed=false
             if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
                 restart_needed=true
-            fi
-
-            # ── Translate Windows path to WSL format ──────────────────────────────
-            local compose_path="$compose_file"
-            if [ -n "$compose_path" ]; then
-                compose_path="${compose_path//\\//}"
-                if [[ "$compose_path" =~ ^[a-zA-Z]:/ ]]; then
-                    compose_path=$(wslpath -u "$compose_path" 2>/dev/null || echo "$compose_path")
-                fi
             fi
 
             # ── Print tailored block ──────────────────────────────────────────
@@ -813,14 +903,14 @@ configure_app_containers() {
 
     if [ -n "$container_ids" ]; then
         local inspect_data
-        inspect_data=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{.Id}}' $container_ids 2>/dev/null || true)
+        inspect_data=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.working_dir"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{.Id}}|{{range .Mounts}}{{.Source}}?{{end}}' $container_ids 2>/dev/null || true)
 
         while IFS= read -r details; do
             [ -z "$details" ] && continue
 
             # Parse fields
-            local cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips long_id
-            IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips long_id <<< "$details"
+            local cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks raw_ports ips long_id mounts
+            IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks raw_ports ips long_id mounts <<< "$details"
 
             local is_npm=false
             if [ -n "$npm_id" ]; then
@@ -839,7 +929,11 @@ configure_app_containers() {
         start="${start#<no value>}"
         port_label="${port_label#<no value>}"
         compose_file="${compose_file#<no value>}"
+        working_dir="${working_dir#<no value>}"
         svc_name="${svc_name#<no value>}"
+
+        local compose_path
+        compose_path=$(resolve_compose_file "$compose_file" "$working_dir" "$mounts")
 
         # Parse exposed and published ports from raw_ports
         local exposed_ports="" published_ports=""
@@ -1028,15 +1122,6 @@ configure_app_containers() {
         fi
         user_start="${user_start// /}"
         [ -z "$user_start" ] && user_start="30"
-
-        # ── Translate Windows path to WSL format ──────────────────────────────
-        local compose_path="$compose_file"
-        if [ -n "$compose_path" ]; then
-            compose_path="${compose_path//\\//}"
-            if [[ "$compose_path" =~ ^[a-zA-Z]:/ ]]; then
-                compose_path=$(wslpath -u "$compose_path" 2>/dev/null || echo "$compose_path")
-            fi
-        fi
 
         # ── Build the proposed additions/changes ──────────────────────────────
         local label_block append_content ip_labels_text
