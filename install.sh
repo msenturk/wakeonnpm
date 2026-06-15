@@ -581,9 +581,11 @@ run_install() {
 
         backup_file "$local_path"
         echo -ne "  Downloading ${BOLD}$local_path${NC} ... "
-        if curl -fsSL "$url" -o "$local_path"; then
+        if curl -fsSL "$url" > "${local_path}.tmp"; then
+            mv "${local_path}.tmp" "$local_path"
             echo -e "${GREEN}done${NC}"
         else
+            rm -f "${local_path}.tmp"
             echo -e "${RED}FAILED${NC}"
             err "Could not download $url"
             err "Check your internet connection or download manually:"
