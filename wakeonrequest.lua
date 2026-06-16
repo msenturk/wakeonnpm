@@ -216,7 +216,7 @@ local SPLASH_TEMPLATE = [[
 ]]
 
 local function html_escape(s)
-    return s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
+    return s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
 end
 
 local function render_splash(name)
@@ -403,19 +403,12 @@ end
 -- @param target_port string (optional): Port to probe for TCP connectivity
 -- @param hint_ip string (optional): Previously known IP to prefer over DNS
 -- @return boolean, err string|nil
-local function wait_until_ready(name, start_timeout, target_port, hint_ip, poll_interval, initial_data)
+local function wait_until_ready(name, start_timeout, target_port, hint_ip, poll_interval)
     local timeout  = start_timeout or _M.DEFAULT_START
     local deadline = ngx.now() + timeout
-    local current_data = initial_data
 
     while ngx.now() < deadline do
-        local data, err
-        if current_data then
-            data = current_data
-            current_data = nil
-        else
-            data, err = inspect(name)
-        end
+        local data, err = inspect(name)
         if not err and data and data.State then
             local st = data.State.Status
             if st == "running" then
@@ -463,7 +456,7 @@ local function schedule_check(name, idle_timeout, timer_interval)
         if premature or not shared_get("timer_active:" .. name) then return end
         local state, state_err = get_state(name)
         if state_err then
-            -- Docker unreachable, reschedule and try again later
+            ngx.log(ngx.WARN, "[wakeonrequest] get_state failed for '", name, "': ", state_err, " — will retry")
         elseif state ~= "running" then
             -- Already stopped (by us, by user, or crashed). Exit timer chain.
             shared_del("timer_active:" .. name)
@@ -505,6 +498,15 @@ _M.RESCAN_INTERVAL = 120
 function _M.auto_start_timers()
     if ngx.worker.id() ~= 0 then return end
 
+    -- Clear stale timer-active flags from previous worker instance.
+    -- Without this, a reload leaves orphaned flags that cause duplicate timers.
+    local dict = ngx.shared[_M.SHARED_DICT]
+    if dict and dict.get_keys then
+        for _, k in ipairs(dict:get_keys(0)) do
+            if k:match("^timer_active:") then dict:delete(k) end
+        end
+    end
+
     local registered = {}
 
     local function scan_loop(premature)
@@ -512,9 +514,11 @@ function _M.auto_start_timers()
 
         local tracked = {}
         -- 1. Discover via Docker labels
+        local discover_failed = false
         local containers, disc_err = discover_managed_containers()
         if not containers then
-            ngx.log(ngx.WARN, "[wakeonrequest] discover failed, skipping rescan: ", disc_err)
+            discover_failed = true
+            ngx.log(ngx.WARN, "[wakeonrequest] discover failed, skipping label scan: ", disc_err)
         else
             for _, c in ipairs(containers) do
                 tracked[c.name] = { idle = c.idle, timer = _M.TIMER_INTERVAL }
@@ -527,32 +531,34 @@ function _M.auto_start_timers()
                     end
                 end
             end
+        end
 
-            -- 2. Discover via Shared Dict (containers configured in NPM UI)
-            local dict = ngx.shared[_M.SHARED_DICT]
-            if dict and dict.get_keys then
-                for _, k in ipairs(dict:get_keys(0)) do
-                    local name = k:match("^config:(.+)$")
-                    if name then
-                        local cfg = json.decode(shared_get(k) or "{}")
-                        tracked[name] = {
-                            idle = cfg.idle or _M.DEFAULT_IDLE,
-                            timer = cfg.timer or _M.TIMER_INTERVAL
-                        }
-                    end
+        -- 2. Discover via Shared Dict (containers configured in NPM UI)
+        local dict = ngx.shared[_M.SHARED_DICT]
+        if dict and dict.get_keys then
+            for _, k in ipairs(dict:get_keys(0)) do
+                local name = k:match("^config:(.+)$")
+                if name then
+                    local cfg = json.decode(shared_get(k) or "{}")
+                    tracked[name] = {
+                        idle = cfg.idle or _M.DEFAULT_IDLE,
+                        timer = cfg.timer or _M.TIMER_INTERVAL
+                    }
                 end
             end
+        end
 
-            -- 3. Initialize background timers for new containers
-            for name, cfg in pairs(tracked) do
-                if not registered[name] or not shared_get("timer_active:" .. name) then
-                    registered[name] = true
-                    shared_set("timer_active:" .. name, true)
-                    schedule_check(name, cfg.idle, cfg.timer)
-                end
+        -- 3. Initialize background timers for new containers
+        for name, cfg in pairs(tracked) do
+            if not registered[name] or not shared_get("timer_active:" .. name) then
+                registered[name] = true
+                shared_set("timer_active:" .. name, true)
+                schedule_check(name, cfg.idle, cfg.timer)
             end
+        end
 
-            -- 4. Cleanup timers for removed containers
+        -- 4. Cleanup timers for removed containers
+        if not discover_failed then
             local to_remove = {}
             for name in pairs(registered) do
                 if not tracked[name] then
@@ -587,7 +593,7 @@ function _M.wake(name, opts)
 
     -- Clean up the 'retry' query parameter early
     -- to prevent it from leaking into error pages or other middleware
-    local args = ngx.req.get_uri_args()
+    local args = ngx.req.get_uri_args(100)
     if args.retry then
         args.retry = nil
         ngx.req.set_uri_args(args)
@@ -671,7 +677,6 @@ function _M.wake(name, opts)
     end
 
     if state ~= "running" or shared_get(splash_key) then
-        local seed_data = nil
         -- Only the first request triggers the actual 'docker start' command
         if state ~= "running" and dict and dict:add(lock_key, true, start_timeout + 30) then
             if splash_enabled then shared_set(splash_key, true, start_timeout + 30) end
@@ -684,13 +689,12 @@ function _M.wake(name, opts)
                 return
             end
             ngx.sleep(0.5)
-            seed_data = data
         end
 
         -- Everyone (first request AND subsequent splash reloads) waits for readiness
         local wait_limit = splash_enabled and 0.5 or start_timeout
         local poll_interval = opts and tonumber(opts.poll_interval) or nil
-        local ready, wait_err = wait_until_ready(name, wait_limit, detected_port, target_ip, poll_interval, seed_data)
+        local ready, wait_err = wait_until_ready(name, wait_limit, detected_port, target_ip, poll_interval)
 
         if not ready then
             if splash_enabled then
