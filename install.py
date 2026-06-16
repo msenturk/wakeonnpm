@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -709,6 +710,7 @@ class ComposeResolver:
         config_files: str,
         working_dir: str,
         mounts: list[str],
+        service_name: Optional[str] = None,
     ) -> Optional[Path]:
         # Strategy 1: config_files label
         if config_files:
@@ -727,7 +729,7 @@ class ComposeResolver:
 
         # Strategy 3: Walk up from each bind mount (up to 4 parents)
         for mount_src in mounts:
-            candidate = self._search_from_mount(mount_src)
+            candidate = self._search_from_mount(mount_src, service_name)
             if candidate:
                 return candidate
 
@@ -737,7 +739,7 @@ class ComposeResolver:
 
         return None
 
-    def _search_from_mount(self, mount_src: str) -> Optional[Path]:
+    def _search_from_mount(self, mount_src: str, service_name: Optional[str] = None) -> Optional[Path]:
         p = self._wsl_path(mount_src)
         if p is None:
             return None
@@ -748,6 +750,8 @@ class ComposeResolver:
             for name in self._FILENAMES:
                 candidate = p / name
                 if candidate.is_file():
+                    if service_name and service_name not in candidate.read_text():
+                        continue
                     return candidate
             p = p.parent
             depth += 1
@@ -785,7 +789,7 @@ class ComposePatcher:
 
     def backup(self) -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        bak = self.path.with_suffix(f".yml.bak.{ts}.{os.getpid()}")
+        bak = self.path.with_suffix(f"{self.path.suffix}.bak.{ts}.{uuid.uuid4().hex[:8]}")
         shutil.copy2(self.path, bak)
         Console.info(f"Backed up {self.path.name} → {bak.name}")
         return bak
@@ -883,6 +887,22 @@ def _detect_host_ip() -> str:
     except Exception:
         pass
     try:
+        import netifaces
+        gws = netifaces.gateways()
+        default_gw = gws.get("default", {}).get(netifaces.AF_INET)
+        if default_gw:
+            return netifaces.ifaddresses(default_gw[1])[netifaces.AF_INET][0]["addr"]
+    except Exception:
+        pass
+    try:
+        result = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        for item in result:
+            ip = item[4][0]
+            if ip != "127.0.0.1":
+                return ip
+    except Exception:
+        pass
+    try:
         result = subprocess.run(
             ["ip", "route", "get", "1"],
             capture_output=True,
@@ -894,6 +914,9 @@ def _detect_host_ip() -> str:
             return m.group(1)
     except Exception:
         pass
+        
+    Console.warn("Could not detect local host IP (network down or air-gapped). Falling back to 127.0.0.1.")
+    Console.info("  You will likely need to set the Proxy Host forward IP manually in NPM!")
     return "127.0.0.1"
 
 
@@ -905,7 +928,7 @@ def _backup_file(path: Path) -> None:
     if not path.exists():
         return
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    bak = path.with_suffix(f"{path.suffix}.bak.{ts}.{os.getpid()}")
+    bak = path.with_suffix(f"{path.suffix}.bak.{ts}.{uuid.uuid4().hex[:8]}")
     shutil.copy2(path, bak)
     Console.info(f"Backed up {path.name} → {bak.name}")
 
@@ -1040,6 +1063,7 @@ def run_dry_run(
                 info.compose_config_files,
                 info.compose_working_dir,
                 info.mounts,
+                info.compose_service or info.name,
             )
 
             # Already configured
@@ -1216,6 +1240,7 @@ def configure_containers(
             info.compose_config_files,
             info.compose_working_dir,
             info.mounts,
+            info.compose_service or info.name,
         )
 
         npm_config = db.find_config_for(info.name, info.ips, info.published_ports)
