@@ -643,7 +643,7 @@ class NpmDatabase:
                     domains = json.loads(raw_domains)
                     first_domain = domains[0] if domains else ""
                 except Exception:
-                    first_domain = raw_domains.strip('[]"').split(",")[0].strip()
+                    first_domain = raw_domains.strip('[]"\'').split(",")[0].strip()
 
                 return {
                     "domain": first_domain,
@@ -693,6 +693,7 @@ class NpmDatabase:
                 return cur.rowcount
         except Exception:
             return None
+
     def write_advanced_config(self, domain: str, snippet: str) -> Optional[int]:
         """Inject `snippet` into the NPM advanced_config column for the proxy host
         matching `domain`. Uses parameterized queries to prevent SQL injection.
@@ -701,12 +702,13 @@ class NpmDatabase:
         npm_cid = self._get_npm_cid()
 
         # Strategy 1: direct local SQLite file (safest — no shell involved)
-        db = self._find_npm_db_via_inspect(npm_cid) if npm_cid else None
-        if not db:
-            db = self._local_db()
-        if db:
+        db_path = self._find_npm_db_via_inspect(npm_cid) if npm_cid else None
+        if not db_path:
+            db_path = self._local_db()
+        if db_path:
+            Console.info(f"Writing to NPM database at {db_path} ...")
             try:
-                with sqlite3.connect(str(db)) as conn:
+                with sqlite3.connect(str(db_path)) as conn:
                     cur = conn.execute(
                         "UPDATE proxy_host SET advanced_config = ? "
                         "WHERE is_deleted = 0 AND domain_names LIKE ?",
@@ -714,25 +716,33 @@ class NpmDatabase:
                     )
                     conn.commit()
                     return cur.rowcount
-            except Exception:
-                pass
+            except Exception as exc:
+                Console.warn(f"Direct DB write failed: {exc}")
 
-        # Strategy 2: docker exec python3 with escaped snippet
+        # Strategy 2: docker exec python3 using a proper parameterized script
         if npm_cid:
-            snippet_escaped = snippet.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
-            domain_escaped  = domain.replace("'", "\\'")
-            py_cmd = (
-                "import sqlite3; conn=sqlite3.connect('/data/database.sqlite'); "
-                f"cur=conn.execute(\"UPDATE proxy_host SET advanced_config=? "
-                f"WHERE is_deleted=0 AND domain_names LIKE ?\","
-                f"['{snippet_escaped}','%{domain_escaped}%']); conn.commit(); print(cur.rowcount)"
+            Console.info(f"Writing via docker exec into container {npm_cid[:12]} ...")
+            py_script = (
+                "import sqlite3\n"
+                "conn = sqlite3.connect('/data/database.sqlite')\n"
+                f"snippet = {snippet!r}\n"
+                f"domain  = {domain!r}\n"
+                "cur = conn.execute(\n"
+                "    'UPDATE proxy_host SET advanced_config=?'\n"
+                "    ' WHERE is_deleted=0 AND domain_names LIKE ?',\n"
+                "    (snippet, '%' + domain + '%')\n"
+                ")\n"
+                "conn.commit()\n"
+                "print(cur.rowcount)\n"
             )
-            out = self._docker.run_exec(npm_cid, ["python3", "-c", py_cmd])
+            out = self._docker.run_exec(npm_cid, ["python3", "-c", py_script])
             if out and out.strip():
                 try:
                     return int(out.strip())
                 except ValueError:
-                    pass
+                    Console.warn(f"Unexpected output from docker exec: {out.strip()!r}")
+            else:
+                Console.warn("docker exec returned no output — python3 may not be available in the NPM container.")
 
         return None
 
