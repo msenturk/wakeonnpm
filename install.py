@@ -254,8 +254,8 @@ class DockerClient:
     def _detect_sudo_context(self) -> bool:
         sudo_user = os.environ["SUDO_USER"]
         try:
-            import pwd
-            user_info = pwd.getpwnam(sudo_user)
+            import pwd  # type: ignore[import-not-found,import-untyped]
+            user_info = pwd.getpwnam(sudo_user)  # type: ignore[attr-defined]
             uid = user_info.pw_uid
             home = user_info.pw_dir
         except Exception:
@@ -817,7 +817,8 @@ class ComposePatcher:
             # Find first indented volumes: block and insert after it
             match = re.search(r"([ \t]+volumes:[ \t]*\n)", text)
             if match:
-                indent = len(re.match(r"[ \t]*", match.group(1)).group(0))
+                m = re.match(r"[ \t]*", match.group(1))
+                indent = len(m.group(0)) if m else 0
                 vol_indent = " " * (indent + 2)
                 insertion = f"{vol_indent}- {vol}\n"
                 pos = match.end()
@@ -888,7 +889,7 @@ def _detect_host_ip() -> str:
     except Exception:
         pass
     try:
-        import netifaces
+        import netifaces  # type: ignore[import-not-found,import-untyped]
         gws = netifaces.gateways()
         default_gw = gws.get("default", {}).get(netifaces.AF_INET)
         if default_gw:
@@ -898,7 +899,7 @@ def _detect_host_ip() -> str:
     try:
         result = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
         for item in result:
-            ip = item[4][0]
+            ip = str(item[4][0])
             if ip != "127.0.0.1":
                 return ip
     except Exception:
