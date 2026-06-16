@@ -156,6 +156,12 @@ Custom logs are stored in standard locations. To prevent log exhaustion:
 
 ---
 
+## Known Limitations
+
+* **Mixed Splash Configuration**: `wakeonrequest` uses a single TTL-bound shared memory key per container to track the splash screen lock. If you have multiple proxy hosts pointing to the same container—where one host has the splash screen enabled and another has it disabled—a timeout on the splash-disabled host could inadvertently clear the splash screen block for the enabled host. It's recommended to keep `wake_splash` consistent across all proxy hosts mapping to the same container.
+
+---
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.

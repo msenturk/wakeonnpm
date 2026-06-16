@@ -215,11 +215,15 @@ local SPLASH_TEMPLATE = [[
 </html>
 ]]
 
+local function html_escape(s)
+    return s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;")
+end
+
 local function render_splash(name)
     ngx.status = ngx.HTTP_OK
     ngx.header.content_type = "text/html; charset=utf-8"
     ngx.header.cache_control = "no-store"
-    local html = SPLASH_TEMPLATE:gsub("{name}", name)
+    local html = SPLASH_TEMPLATE:gsub("{name}", html_escape(name))
     ngx.say(html)
 end
 
@@ -349,6 +353,32 @@ local function discover_managed_containers()
     return result, nil
 end
 
+-- ── Shared-dict helpers ───────────────────────────────────────────────────────
+
+local function shared_set(key, value, ttl)
+    local d = ngx.shared[_M.SHARED_DICT]
+    if d then
+        local success, err = d:set(key, value, ttl or 0)
+        if not success then
+            ngx.log(ngx.WARN, "[wakeonrequest] shared_set failed for '", key, "': ", err)
+        end
+    end
+end
+
+local function shared_get(key)
+    local d = ngx.shared[_M.SHARED_DICT]
+    return d and d:get(key)
+end
+
+local function shared_del(key)
+    local d = ngx.shared[_M.SHARED_DICT]
+    if d then d:delete(key) end
+end
+
+local function touch(name)
+    shared_set("seen:" .. name, ngx.now())
+end
+
 -- ── Container control ─────────────────────────────────────────────────────────
 
 local function start_container(name)
@@ -411,7 +441,11 @@ local function wait_until_ready(name, start_timeout, target_port, hint_ip, poll_
                     local port_num = tonumber(tostring(target_port):match("^(%d+)")) or tonumber(target_port)
                     if port_num then
                         local pok, _ = sock:connect(probe_host, port_num)
-                        if pok then sock:close(); return true end
+                        if pok then
+                            sock:close()
+                            return true
+                        end
+                        sock:close()
                     end
                 elseif healthy then return true end
             elseif st == "exited" or st == "dead" then return false, "exited" end
@@ -421,31 +455,6 @@ local function wait_until_ready(name, start_timeout, target_port, hint_ip, poll_
     return false, "timeout"
 end
 
--- ── Shared-dict helpers ───────────────────────────────────────────────────────
-
-local function shared_set(key, value, ttl)
-    local d = ngx.shared[_M.SHARED_DICT]
-    if d then
-        local success, err = d:set(key, value, ttl or 0)
-        if not success then
-            ngx.log(ngx.WARN, "[wakeonrequest] shared_set failed for '", key, "': ", err)
-        end
-    end
-end
-
-local function shared_get(key)
-    local d = ngx.shared[_M.SHARED_DICT]
-    return d and d:get(key)
-end
-
-local function shared_del(key)
-    local d = ngx.shared[_M.SHARED_DICT]
-    if d then d:delete(key) end
-end
-
-local function touch(name)
-    shared_set("seen:" .. name, ngx.now())
-end
 
 -- ── Idle-stop timer ───────────────────────────────────────────────────────────
 
@@ -453,7 +462,16 @@ local function schedule_check(name, idle_timeout, timer_interval)
     local ok, timer_err = ngx.timer.at(timer_interval or _M.TIMER_INTERVAL, function(premature)
         if premature or not shared_get("timer_active:" .. name) then return end
         local state, state_err = get_state(name)
-        if not state_err and state == "running" then
+        if state_err then
+            -- Docker unreachable, reschedule and try again later
+        elseif state ~= "running" then
+            -- Already stopped (by us, by user, or crashed). Exit timer chain.
+            shared_del("timer_active:" .. name)
+            shared_del("seen:" .. name)
+            ngx.log(ngx.INFO, "[wakeonrequest] container '", name, "' not running, timer chain ended")
+            return
+        else
+            -- running: check idle
             local last = shared_get("seen:" .. name)
             if last and (ngx.now() - last) > idle_timeout then
                 ngx.log(ngx.INFO, "[wakeonrequest] stopping idle container: ", name)
@@ -486,21 +504,25 @@ _M.RESCAN_INTERVAL = 120
 -- 3. Perform idle-stop checks for all tracked containers in a single loop.
 function _M.auto_start_timers()
     if ngx.worker.id() ~= 0 then return end
-    ngx.timer.at(0, function()
-        local registered = {}
-        while true do
-            local tracked = {}
-            -- 1. Discover via Docker labels
-            local containers = discover_managed_containers()
-            if containers then
-                for _, c in ipairs(containers) do
-                    tracked[c.name] = { idle = c.idle, timer = _M.TIMER_INTERVAL }
-                    if c.domain and c.domain ~= "" then
-                        for d in string.gmatch(c.domain, "([^,]+)") do
-                            local clean_d = d:match("^%s*(.-)%s*$")
-                            if clean_d ~= "" then
-                                shared_set("domain:" .. clean_d, c.name)
-                            end
+
+    local registered = {}
+
+    local function scan_loop(premature)
+        if premature then return end
+
+        local tracked = {}
+        -- 1. Discover via Docker labels
+        local containers, disc_err = discover_managed_containers()
+        if not containers then
+            ngx.log(ngx.WARN, "[wakeonrequest] discover failed, skipping rescan: ", disc_err)
+        else
+            for _, c in ipairs(containers) do
+                tracked[c.name] = { idle = c.idle, timer = _M.TIMER_INTERVAL }
+                if c.domain and c.domain ~= "" then
+                    for d in string.gmatch(c.domain, "([^,]+)") do
+                        local clean_d = d:match("^%s*(.-)%s*$")
+                        if clean_d ~= "" then
+                            shared_set("domain:" .. clean_d, c.name)
                         end
                     end
                 end
@@ -523,7 +545,7 @@ function _M.auto_start_timers()
 
             -- 3. Initialize background timers for new containers
             for name, cfg in pairs(tracked) do
-                if not registered[name] then
+                if not registered[name] or not shared_get("timer_active:" .. name) then
                     registered[name] = true
                     shared_set("timer_active:" .. name, true)
                     schedule_check(name, cfg.idle, cfg.timer)
@@ -531,16 +553,22 @@ function _M.auto_start_timers()
             end
 
             -- 4. Cleanup timers for removed containers
+            local to_remove = {}
             for name in pairs(registered) do
                 if not tracked[name] then
-                    registered[name] = nil
-                    shared_del("timer_active:" .. name)
+                    table.insert(to_remove, name)
                 end
             end
-
-            ngx.sleep(_M.RESCAN_INTERVAL)
+            for _, name in ipairs(to_remove) do
+                registered[name] = nil
+                shared_del("timer_active:" .. name)
+            end
         end
-    end)
+
+        ngx.timer.at(_M.RESCAN_INTERVAL, scan_loop)
+    end
+
+    ngx.timer.at(0, scan_loop)
 end
 
 -- ── Main Entrypoint ──────────────────────────────────────────────────────────
@@ -581,12 +609,12 @@ function _M.wake(name, opts)
     end
 
     if opts and type(opts) == "table" then
-        shared_set("config:" .. name, json.encode({
-            idle = tonumber(opts.idle_timeout),
-            start = tonumber(opts.start_timeout),
-            timer = tonumber(opts.timer_interval),
-            poll = tonumber(opts.poll_interval)
-        }), _M.RESCAN_INTERVAL * 3)
+        local cfg = {}
+        if opts.idle_timeout then cfg.idle = tonumber(opts.idle_timeout) end
+        if opts.start_timeout then cfg.start = tonumber(opts.start_timeout) end
+        if opts.timer_interval then cfg.timer = tonumber(opts.timer_interval) end
+        if opts.poll_interval then cfg.poll = tonumber(opts.poll_interval) end
+        shared_set("config:" .. name, json.encode(cfg), _M.RESCAN_INTERVAL * 3)
     end
 
     local start_timeout = _M.DEFAULT_START
@@ -643,6 +671,7 @@ function _M.wake(name, opts)
     end
 
     if state ~= "running" or shared_get(splash_key) then
+        local seed_data = nil
         -- Only the first request triggers the actual 'docker start' command
         if state ~= "running" and dict and dict:add(lock_key, true, start_timeout + 30) then
             if splash_enabled then shared_set(splash_key, true, start_timeout + 30) end
@@ -654,15 +683,14 @@ function _M.wake(name, opts)
                 ngx.exit(ngx.HTTP_SERVICE_UNAVAILABLE)
                 return
             end
-            -- Renew the lock TTL to cover the full wait window
-            shared_set(lock_key, true, start_timeout + 10)
             ngx.sleep(0.5)
+            seed_data = data
         end
 
         -- Everyone (first request AND subsequent splash reloads) waits for readiness
         local wait_limit = splash_enabled and 0.5 or start_timeout
         local poll_interval = opts and tonumber(opts.poll_interval) or nil
-        local ready, wait_err = wait_until_ready(name, wait_limit, detected_port, target_ip, poll_interval, data)
+        local ready, wait_err = wait_until_ready(name, wait_limit, detected_port, target_ip, poll_interval, seed_data)
 
         if not ready then
             if splash_enabled then
@@ -682,6 +710,7 @@ function _M.wake(name, opts)
         -- Ready! Cleanup locks
         shared_del(lock_key)
         shared_del(splash_key)
+        shared_set(alive_key, true, _M.ALIVE_TTL)
     end
 
     ngx.log(ngx.INFO, "[wakeonrequest] '", name, "' ready")
@@ -692,15 +721,11 @@ function _M.global_wake()
     local name = ngx.var.wake_container
 
     if not name or name == "" then
-        local host = ngx.var.host
-        if host then
-            name = shared_get("domain:" .. host)
-            if not name then
-                local root_domain = host:match("^[^.]+%.(.+)$")
-                if root_domain then
-                    name = shared_get("domain:" .. root_domain)
-                end
-            end
+        local h = ngx.var.host
+        while h do
+            name = shared_get("domain:" .. h)
+            if name then break end
+            h = h:match("^[^.]+%.(.+)$")
         end
     end
 
